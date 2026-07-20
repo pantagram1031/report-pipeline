@@ -2,9 +2,15 @@
 """Deterministic, fail-closed feature tagging for HWPX documents.
 
 The public contract is :func:`extract_feature_counts`: a lexicographically
-sorted ``{tag: count}`` mapping.  Counts are positive integers.  Controls below
-``<...:ctrl>`` that are not in the known control vocabulary are preserved as
-``unknown:<local-name>`` tags so certification can never silently cover them.
+sorted ``{tag: count}`` mapping.  Counts are positive integers.  Every element
+in section body XML is either feature-handled, explicitly known-benign, or
+preserved as ``unknown:<local-name>`` so certification fails closed.
+
+Scope boundary: the unknown-classification walk covers ``Contents/section*.xml``
+(section body content) only.  Document-level definition parts such as
+``Contents/header.xml`` (charPr/paraPr/borderFill/style/numbering vocabularies)
+are not classified by this walk; new rendering-significant *section-body*
+elements are what the fail-closed contract guards against.
 """
 from __future__ import annotations
 
@@ -22,15 +28,6 @@ from xml.etree import ElementTree
 SCHEMA_VERSION = 1
 HWP_UNITS_PER_MM = 7200.0 / 25.4
 
-_KNOWN_CONTROL_CHILDREN = frozenset({
-    "autoNum", "bookmark", "clickhere", "colPr", "compose", "ctrlData",
-    "dutmal", "endNote", "fieldBegin", "fieldEnd", "footer", "footNote",
-    "fwSpace", "header", "hiddenComment", "hyperlink", "indexmark",
-    "lineBreak", "memo", "newNum", "nbSpace", "pageHiding", "pageNum",
-    "pageNumPos", "revision", "tab", "tbl", "equation", "pic", "image",
-    "img", "arc", "connectLine", "container", "curve", "ellipse", "line",
-    "ole", "polygon", "rect", "shape", "textart", "video",
-})
 _IMAGE_TAGS = frozenset({"pic", "image", "img"})
 _SHAPE_TAGS = frozenset({
     "arc", "connectLine", "container", "curve", "ellipse", "ole", "polygon",
@@ -39,6 +36,20 @@ _SHAPE_TAGS = frozenset({
 _LINE_TAGS = frozenset({"line"})
 _FLOATING_TAGS = _IMAGE_TAGS | _SHAPE_TAGS | _LINE_TAGS | frozenset({
     "equation", "tbl",
+})
+
+# Feature-bearing or feature-input elements understood by this extractor.
+FEATURE_HANDLED_SECTION_TAGS = frozenset({
+    "colPr", "endNote", "equation", "fieldBegin", "font", "fontRef",
+    "footer", "footNote", "header", "hyperlink", "margin", "pagePr", "pos",
+    "tbl",
+}) | _IMAGE_TAGS | _SHAPE_TAGS | _LINE_TAGS
+
+# Curated from the section-body tags in the repository's sanitized/synthetic
+# HWPX fixtures.  Additions require an explicit rendering-significance review.
+KNOWN_BENIGN_SECTION_TAGS = frozenset({
+    "cellAddr", "cellSpan", "ctrl", "lineseg", "linesegarray", "p", "run",
+    "script", "sec", "section", "secPr", "subList", "t", "tc", "tr",
 })
 
 
@@ -209,13 +220,14 @@ def extract_feature_counts(document: str | Path) -> dict[str, int]:
                 )
                 counts[f"page-margins:{_page_margin_class(margin) if margin is not None else 'custom'}"] += 1
 
-            if local == "ctrl":
-                for child in list(element):
-                    if not isinstance(child.tag, str):
-                        continue
-                    child_local = _local_name(child.tag)
-                    if child_local not in _KNOWN_CONTROL_CHILDREN:
-                        counts[f"unknown:{child_local}"] += 1
+    classified = FEATURE_HANDLED_SECTION_TAGS | KNOWN_BENIGN_SECTION_TAGS
+    for root in section_roots:
+        for element in root.iter():
+            if not isinstance(element.tag, str):
+                continue
+            local = _local_name(element.tag)
+            if local not in classified:
+                counts[f"unknown:{local}"] += 1
 
     if maximum_table_depth:
         counts["nested-table-depth"] = maximum_table_depth

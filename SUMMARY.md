@@ -57,6 +57,47 @@ Final required checks:
   pre-existing synthetic privacy-scanner fixture warnings).
 - `git diff --check` — clean.
 
+## Adversarial fix round (2026-07-20)
+
+- Certificate trust is now externally bound:
+  - certificates embed normalized per-document measurement records and a
+    re-verifiable measurement hash;
+  - issue and verify re-derive the envelope and split statistics from the
+    hash-anchored manifest feature maps, embedded measurements, and thresholds;
+  - `pipeline/scripts/receipt_sign.py` creates/loads
+    `${RIGORLOOM_PROFILE_ROOT}/keys/render_cert.key` with POSIX mode 0600 or a
+    Windows owner-only DACL and authenticates canonical certificate bytes with
+    HMAC-SHA256;
+  - missing keys, missing/stale HMACs, measurement drift, and derived-envelope
+    drift all fail closed with stable reason codes.
+- Feature extraction now classifies every section-body descendant by local
+  name against explicit feature-handled and fixture-curated benign constants;
+  every other element emits `unknown:<local-name>`. A synthetic
+  `<hp:chart>` run child is therefore unknown and cannot enter an envelope.
+- The certification plan now records the downward-closed envelope induction
+  caveat. Operator documentation records the private key and full verification
+  requirements. The audited runtime ladder wiring was not changed.
+- Red-first adversarial coverage includes recomputed-self-hash envelope
+  widening with absent/stale HMACs, raised thresholds with a stale HMAC,
+  manifest/measurement envelope drift, embedded measurement-hash drift,
+  corpus-less fabrication without a valid signature, missing verification key,
+  first-use key generation, and the run-child unknown-tag path.
+
+Fix-round verification:
+
+- `python -m pytest -q pipeline/tests/test_feature_extract.py pipeline/tests/test_render_cert.py`
+  -> 22 passed, 2 subtests passed.
+- Certification/runtime integration slice
+  -> 105 passed, 1 skipped, 10 subtests passed.
+- `python -m pytest -q`
+  -> 634 passed, 1 skipped, 28 subtests passed in 427.39 seconds.
+- `python -m compileall -q pipeline/scripts`
+  -> passed.
+- `python pipeline/scripts/privacy_scan.py . --json`
+  -> HARD 0, WARN 2 (unchanged synthetic scanner-fixture warnings).
+- `git diff --check`
+  -> clean.
+
 ## Deviations and boundaries
 
 No deviations from the plan's Codex work split. Real five-form corpus documents,

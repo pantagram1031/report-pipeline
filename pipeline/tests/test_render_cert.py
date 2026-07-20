@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib.util
 import json
+import os
+import stat
 import shutil
 import sys
 import tempfile
 import unittest
 import zipfile
+from copy import deepcopy
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -22,15 +27,19 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_hwpx(path: Path, *, unknown: bool = False, sections: int = 1) -> None:
+def _write_hwpx(
+    path: Path, *, unknown: bool = False, run_child_unknown: bool = False,
+    sections: int = 1,
+) -> None:
     control = "<hp:ctrl><hp:alien/></hp:ctrl>" if unknown else ""
+    run_child = "<hp:chart/>" if run_child_unknown else ""
     section = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<hs:sec xmlns:hs="urn:section" xmlns:hp="urn:paragraph">'
         '<hp:p><hp:run><hp:secPr><hp:pagePr width="59528" height="84186">'
         '<hp:margin left="5669" right="5669" top="5669" bottom="5669"/>'
         '</hp:pagePr></hp:secPr><hp:ctrl><hp:colPr colCount="1"/></hp:ctrl>'
-        f'{control}</hp:run></hp:p></hs:sec>'
+        f'{control}{run_child}</hp:run></hp:p></hs:sec>'
     )
     with zipfile.ZipFile(path, "w") as archive:
         for index in range(sections):
@@ -56,9 +65,20 @@ class RenderCertTestCase(unittest.TestCase):
         _write_hwpx(self.doc)
         self.features = feature_extract.extract_feature_counts(self.doc)
         self.manifest = self.root / "manifest.json"
+        self.profile_root = self.root / "profile"
+        self.profile_root.mkdir()
+        self.key_path = self.profile_root / "keys" / "render_cert.key"
+        self.key_path.parent.mkdir()
+        self.key_path.write_bytes(b"test-render-certificate-key-32b")
+        os.chmod(self.key_path, 0o600)
+        self._environment = mock.patch.dict(
+            os.environ, {"RIGORLOOM_PROFILE_ROOT": str(self.profile_root)},
+        )
+        self._environment.start()
         self._write_manifest()
 
     def tearDown(self):
+        self._environment.stop()
         self._tmp.cleanup()
 
     def _write_manifest(self):
@@ -112,6 +132,16 @@ class RenderCertTestCase(unittest.TestCase):
             "raster_changed_channel_ratio": 0.01,
         }
 
+    def _resign(self, certificate: dict) -> None:
+        certificate.pop("certificate_hmac_sha256", None)
+        certificate["certificate_sha256"] = render_cert._certificate_digest(certificate)
+        canonical = json.dumps(
+            certificate, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        certificate["certificate_hmac_sha256"] = hmac.new(
+            self.key_path.read_bytes(), canonical, hashlib.sha256,
+        ).hexdigest()
+
     def test_holdout_failure_excludes_affected_feature_combination(self):
         certificate = render_cert.issue_certificate(
             self._measurements(holdout_pass=False),
@@ -135,6 +165,19 @@ class RenderCertTestCase(unittest.TestCase):
             {"id": "large-holdout", "split": "holdout", "features": larger,
              "metrics": _metrics()},
         ]
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        template = manifest["documents"][0]
+        manifest["documents"] = []
+        for record in measurements["documents"]:
+            entry = deepcopy(template)
+            entry.update({
+                "id": record["id"],
+                "split": record["split"],
+                "features": record["features"],
+            })
+            manifest["documents"].append(entry)
+        self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        measurements["corpus"]["manifest_sha256"] = _sha256(self.manifest)
 
         certificate = render_cert.issue_certificate(
             measurements, self._thresholds(),
@@ -181,7 +224,7 @@ class RenderCertTestCase(unittest.TestCase):
             issued_at="2026-07-20T00:00:00Z",
         )
         certificate["hancom_version"] = "Hancom 2025.0"
-        certificate["certificate_sha256"] = render_cert._certificate_digest(certificate)
+        self._resign(certificate)
         cert_path = self.root / "certificate.json"
         render_cert.write_json(cert_path, certificate)
 
@@ -210,6 +253,174 @@ class RenderCertTestCase(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason_code"], "certificate_hash_mismatch")
 
+    def test_widened_envelope_with_recomputed_self_hash_and_absent_or_stale_hmac_is_refused(self):
+        original = render_cert.issue_certificate(
+            self._measurements(), self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+        self._resign(original)
+
+        absent = deepcopy(original)
+        absent["envelope"][0]["features"]["sections"] += 100
+        absent.pop("certificate_hmac_sha256")
+        absent["certificate_sha256"] = render_cert._certificate_digest(absent)
+
+        stale = deepcopy(original)
+        stale["envelope"][0]["features"]["sections"] += 100
+        stale["certificate_sha256"] = render_cert._certificate_digest(stale)
+
+        for label, certificate, reason in (
+            ("absent", absent, "certificate_hmac_missing"),
+            ("stale", stale, "certificate_hmac_mismatch"),
+        ):
+            with self.subTest(label=label):
+                result = render_cert.verify_certificate(
+                    certificate,
+                    renderer_binary=self.binary,
+                    renderer_version="mock 1.0",
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["reason_code"], reason)
+
+    def test_envelope_must_rederive_from_manifest_features_and_measurements(self):
+        certificate = render_cert.issue_certificate(
+            self._measurements(), self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+        certificate["envelope"][0]["features"]["sections"] += 1
+        self._resign(certificate)
+
+        result = render_cert.verify_certificate(
+            certificate,
+            renderer_binary=self.binary,
+            renderer_version="mock 1.0",
+        )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason_code"], "certificate_envelope_mismatch")
+
+    def test_embedded_measurement_hash_is_reverified(self):
+        certificate = render_cert.issue_certificate(
+            self._measurements(), self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+        certificate["measurement_records"][0]["metrics"]["raster"][
+            "changed_channel_ratio"
+        ] = 0.5
+        self._resign(certificate)
+
+        result = render_cert.verify_certificate(
+            certificate,
+            renderer_binary=self.binary,
+            renderer_version="mock 1.0",
+        )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason_code"], "measurement_hash_mismatch")
+
+    def test_raised_threshold_with_recomputed_self_hash_and_stale_hmac_is_refused(self):
+        certificate = render_cert.issue_certificate(
+            self._measurements(), self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+        certificate["thresholds"]["word_anchor_px"] = 9999.0
+        certificate["certificate_sha256"] = render_cert._certificate_digest(certificate)
+
+        result = render_cert.verify_certificate(
+            certificate,
+            renderer_binary=self.binary,
+            renderer_version="mock 1.0",
+        )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason_code"], "certificate_hmac_mismatch")
+
+    def test_widened_envelope_signed_with_different_key_is_refused(self):
+        certificate = render_cert.issue_certificate(
+            self._measurements(), self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+        certificate["envelope"][0]["features"]["tables"] = 999
+        certificate.pop("certificate_hmac_sha256", None)
+        certificate["certificate_sha256"] = render_cert._certificate_digest(certificate)
+        canonical = json.dumps(
+            certificate, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        certificate["certificate_hmac_sha256"] = hmac.new(
+            b"attacker-controlled-key-32-bytes!", canonical, hashlib.sha256,
+        ).hexdigest()
+
+        result = render_cert.verify_certificate(
+            certificate,
+            renderer_binary=self.binary,
+            renderer_version="mock 1.0",
+        )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason_code"], "certificate_hmac_mismatch")
+
+    def test_fabricated_corpus_without_valid_key_signature_is_refused(self):
+        certificate = render_cert.issue_certificate(
+            self._measurements(), self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+        fabricated = self.root / "fabricated-manifest.json"
+        payload = json.loads(self.manifest.read_text(encoding="utf-8"))
+        for index, entry in enumerate(payload["documents"]):
+            entry["document"] = f"missing-corpus-{index}.hwpx"
+            entry["reference_pdf"]["path"] = f"missing-reference-{index}.pdf"
+        fabricated.write_text(json.dumps(payload), encoding="utf-8")
+        certificate["corpus_manifest_path"] = str(fabricated)
+        certificate["corpus_manifest_hash"] = _sha256(fabricated)
+        certificate.pop("certificate_hmac_sha256", None)
+        certificate["certificate_sha256"] = render_cert._certificate_digest(certificate)
+
+        result = render_cert.verify_certificate(
+            certificate,
+            renderer_binary=self.binary,
+            renderer_version="mock 1.0",
+        )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason_code"], "certificate_hmac_missing")
+
+    def test_missing_operator_key_at_verify_is_refused(self):
+        certificate = render_cert.issue_certificate(
+            self._measurements(), self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+        self.key_path.unlink()
+
+        result = render_cert.verify_certificate(
+            certificate,
+            renderer_binary=self.binary,
+            renderer_version="mock 1.0",
+        )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason_code"], "certificate_key_missing")
+
+    def test_issue_generates_restricted_operator_key_and_hmac(self):
+        self.key_path.unlink()
+
+        with mock.patch.object(
+            render_cert.receipt_sign.subprocess, "run",
+            return_value=mock.Mock(returncode=0),
+        ) as restrict_acl:
+            certificate = render_cert.issue_certificate(
+                self._measurements(), self._thresholds(),
+                issued_at="2026-07-20T00:00:00Z",
+            )
+
+        self.assertTrue(self.key_path.is_file())
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(self.key_path.stat().st_mode), 0o600)
+            restrict_acl.assert_not_called()
+        else:
+            restrict_acl.assert_called_once()
+        self.assertEqual(len(self.key_path.read_bytes()), 32)
+        self.assertRegex(certificate["certificate_hmac_sha256"], r"^[0-9a-f]{64}$")
+
     def test_unknown_feature_is_always_refused(self):
         certificate = render_cert.issue_certificate(
             self._measurements(), self._thresholds(),
@@ -227,6 +438,28 @@ class RenderCertTestCase(unittest.TestCase):
         )
         self.assertFalse(result["eligible"])
         self.assertEqual(result["reason_code"], "unknown_feature")
+
+    def test_unknown_run_child_is_never_certifiable(self):
+        unknown_doc = self.root / "unknown-run-child.hwpx"
+        _write_hwpx(unknown_doc, run_child_unknown=True)
+        unknown_features = feature_extract.extract_feature_counts(unknown_doc)
+        self.assertEqual(unknown_features["unknown:chart"], 1)
+
+        measurements = self._measurements()
+        for record in measurements["documents"]:
+            record["features"] = unknown_features
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        for entry in manifest["documents"]:
+            entry["features"] = unknown_features
+        self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        measurements["corpus"]["manifest_sha256"] = _sha256(self.manifest)
+
+        certificate = render_cert.issue_certificate(
+            measurements, self._thresholds(),
+            issued_at="2026-07-20T00:00:00Z",
+        )
+
+        self.assertEqual(certificate["envelope"], [])
 
     def test_envelope_mismatch_is_refused(self):
         certificate = render_cert.issue_certificate(

@@ -130,9 +130,12 @@ LibreOffice as a substitute proof path.
 
 An operator-issued renderer certificate is configured with
 `RIGORLOOM_RENDER_CERTIFICATE=<certificate.json>`. `render_probe` advertises it
-only after the certificate self-hash, corpus-manifest hash, renderer binary
-hash, and pinned renderer/Hancom versions re-verify. A workspace must also set
-top-level `certified_render: true` and `render_certificate: <same path>` in
+only after the operator-key HMAC, embedded measurement hash, manifest-derived
+envelope, corpus-manifest hash, renderer binary hash, and pinned
+renderer/Hancom versions re-verify. Certification and runtime verification
+require `RIGORLOOM_PROFILE_ROOT=<PRIVATE_ROOT>`; first certification creates
+`keys/render_cert.key` there with owner-only permissions. A workspace must
+also set top-level `certified_render: true` and `render_certificate: <same path>` in
 `build.yaml`. After assembly, the dispatcher runs `render_cert check` against
 `output/out.hwpx`; only an envelope match with no `unknown:*` feature may run
 the certified PDF command. The candidate is reopened and atomically replaces

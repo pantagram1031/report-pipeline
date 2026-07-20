@@ -43,6 +43,12 @@ SECTION_XML = """<?xml version="1.0" encoding="UTF-8"?>
 </hs:sec>
 """
 
+RUN_CHILD_UNKNOWN_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hs="urn:section" xmlns:hp="urn:paragraph">
+  <hp:p><hp:run><hp:t>body</hp:t><hp:chart/></hp:run></hp:p>
+</hs:sec>
+"""
+
 
 def _write_hwpx(path: Path, entries: list[tuple[str, str]]) -> None:
     with zipfile.ZipFile(path, "w") as archive:
@@ -99,6 +105,19 @@ class FeatureExtractTestCase(unittest.TestCase):
             bad.write_text("not an hwpx", encoding="utf-8")
             with self.assertRaises(ValueError):
                 feature_extract.extract_feature_counts(bad)
+
+    def test_unknown_run_child_is_emitted_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            document = Path(tmp) / "unknown-run-child.hwpx"
+            _write_hwpx(document, [("Contents/section0.xml", RUN_CHILD_UNKNOWN_XML)])
+
+            features = feature_extract.extract_feature_counts(document)
+
+        self.assertEqual(features["unknown:chart"], 1)
+        self.assertFalse(any(
+            tag.startswith("unknown:") and tag != "unknown:chart"
+            for tag in features
+        ))
 
 
 if __name__ == "__main__":

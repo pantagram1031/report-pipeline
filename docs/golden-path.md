@@ -224,8 +224,9 @@ python pipeline/scripts/pipeline_ctl.py check <WS> submission_preflight
   the assembled HWPX's form-structure hash against `form_baseline.json`, and
   requires `proof_grade` to be `hancom`, `certified`, or `advisory`.
   `certified` additionally requires the build opt-in, a passing live
-  `render_cert check`, and a certificate whose self-hash, corpus manifest,
-  renderer binary, and pinned versions re-verify. Hancom/advisory grades are
+  `render_cert check`, and a certificate whose operator-key HMAC, embedded
+  measurements, manifest-derived envelope, corpus manifest, renderer binary,
+  and pinned versions re-verify. Hancom/advisory grades are
   cross-checked against this machine's actual render capabilities, so a recorded `hancom` grade
   that can't be reproduced here (no Hancom on this delivery machine) is
   rejected rather than trusted blindly.

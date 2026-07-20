@@ -23,12 +23,14 @@ from pathlib import Path
 from typing import Callable
 
 import feature_extract
+import receipt_sign
 
 
 SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DEFAULT_DPI = 300
 DEFAULT_RENDER_TIMEOUT = 240.0
+CERTIFICATE_HMAC_FIELD = "certificate_hmac_sha256"
 
 
 def _json_bytes(payload) -> bytes:
@@ -501,32 +503,53 @@ def _split_stats(records: list[dict], thresholds: dict) -> dict:
 def _certificate_digest(certificate: dict) -> str:
     body = dict(certificate)
     body.pop("certificate_sha256", None)
+    body.pop(CERTIFICATE_HMAC_FIELD, None)
     return _sha256_payload(body)
 
 
-def issue_certificate(
-    measurements: dict | str | Path,
-    thresholds: dict,
-    *,
-    issued_at: str | None = None,
-) -> dict:
-    measured = _read_json(measurements) if isinstance(measurements, (str, Path)) else measurements
-    if not isinstance(measured, dict) or measured.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("measurements must be a schema v1 object")
-    renderer = measured.get("renderer")
-    corpus = measured.get("corpus")
-    documents = measured.get("documents")
-    if not isinstance(renderer, dict) or not isinstance(corpus, dict) or not isinstance(documents, list):
-        raise ValueError("measurements are missing renderer, corpus, or documents")
-    threshold_values = _validate_thresholds(thresholds)
-    for record in documents:
-        if not isinstance(record, dict) or record.get("split") not in {"train", "holdout"}:
-            raise ValueError("measurement document records must declare train/holdout")
-        record["features"] = _validate_feature_map(record.get("features"))
+def _measurement_records_for_manifest(
+    manifest_documents: list[dict], records,
+) -> list[dict]:
+    if not isinstance(records, list):
+        raise ValueError("certificate measurement records must be an array")
+    manifest_by_id = {entry["id"]: entry for entry in manifest_documents}
+    record_by_id: dict[str, dict] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("every measurement record must be an object")
+        record_id = record.get("id")
+        if not isinstance(record_id, str) or record_id in record_by_id:
+            raise ValueError("measurement record ids must be unique strings")
+        record_by_id[record_id] = record
+    if set(record_by_id) != set(manifest_by_id):
+        raise ValueError("measurement records must exactly cover the manifest")
 
+    normalized = []
+    for entry in manifest_documents:
+        record = record_by_id[entry["id"]]
+        if record.get("split") != entry["split"]:
+            raise ValueError("measurement split does not match the manifest")
+        if _validate_feature_map(record.get("features")) != entry["features"]:
+            raise ValueError("measurement features do not match the manifest")
+        normalized_record = dict(record)
+        normalized_record.update({
+            "id": entry["id"],
+            "split": entry["split"],
+            "features": entry["features"],
+        })
+        normalized.append(normalized_record)
+    return normalized
+
+
+def _derive_certificate_claims(
+    manifest_documents: list[dict], records, thresholds: dict,
+) -> dict:
+    threshold_values = _validate_thresholds(thresholds)
+    documents = _measurement_records_for_manifest(manifest_documents, records)
     grouped: dict[str, list[dict]] = defaultdict(list)
     for record in documents:
-        grouped[json.dumps(record["features"], sort_keys=True, separators=(",", ":"))].append(record)
+        key = json.dumps(record["features"], sort_keys=True, separators=(",", ":"))
+        grouped[key].append(record)
     failed_holdout_features = [
         record["features"] for record in documents
         if record["split"] == "holdout"
@@ -551,14 +574,57 @@ def issue_certificate(
                 and all(_document_passes(record, threshold_values) for record in group)):
             envelope.append({
                 "features": group_features,
-                "train_document_ids": [record.get("id") for record in train],
-                "holdout_document_ids": [record.get("id") for record in holdout],
+                "train_document_ids": [record["id"] for record in train],
+                "holdout_document_ids": [record["id"] for record in holdout],
             })
 
     train_records = [record for record in documents if record["split"] == "train"]
     holdout_records = [record for record in documents if record["split"] == "holdout"]
     if not holdout_records:
         raise ValueError("certification requires at least one holdout document")
+    return {
+        "records": documents,
+        "envelope": envelope,
+        "train_stats": _split_stats(train_records, threshold_values),
+        "holdout_stats": _split_stats(holdout_records, threshold_values),
+    }
+
+
+def issue_certificate(
+    measurements: dict | str | Path,
+    thresholds: dict,
+    *,
+    issued_at: str | None = None,
+) -> dict:
+    measurement_path = (
+        Path(measurements).resolve() if isinstance(measurements, (str, Path)) else None
+    )
+    measured = _read_json(measurement_path) if measurement_path else measurements
+    if not isinstance(measured, dict) or measured.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("measurements must be a schema v1 object")
+    renderer = measured.get("renderer")
+    corpus = measured.get("corpus")
+    documents = measured.get("documents")
+    if not isinstance(renderer, dict) or not isinstance(corpus, dict) or not isinstance(documents, list):
+        raise ValueError("measurements are missing renderer, corpus, or documents")
+    threshold_values = _validate_thresholds(thresholds)
+    manifest_raw = corpus.get("manifest_path")
+    manifest_hash = corpus.get("manifest_sha256")
+    if not isinstance(manifest_raw, str) or not manifest_raw:
+        raise ValueError("measurements do not contain a corpus manifest path")
+    manifest_base = measurement_path.parent if measurement_path else Path.cwd()
+    manifest_path = _resolve_recorded_path(manifest_raw, manifest_base)
+    if not manifest_path.is_file() or _sha256_file(manifest_path) != manifest_hash:
+        raise ValueError("measurement corpus manifest hash does not verify")
+    manifest = load_manifest(manifest_path, require_ready=True)
+    claims = _derive_certificate_claims(
+        manifest["documents"], documents, threshold_values,
+    )
+    measurement_records = claims["records"]
+    hancom_versions = {entry["hancom_version"] for entry in manifest["documents"]}
+    if hancom_versions != {corpus.get("hancom_version")}:
+        raise ValueError("measurement Hancom version does not match the manifest")
+
     certificate = {
         "schema_version": SCHEMA_VERSION,
         "renderer_id": renderer.get("id"),
@@ -569,11 +635,12 @@ def issue_certificate(
         "hancom_version": corpus.get("hancom_version"),
         "corpus_manifest_path": corpus.get("manifest_path"),
         "corpus_manifest_hash": corpus.get("manifest_sha256"),
-        "measurement_hash": _sha256_payload(measured),
+        "measurement_records": measurement_records,
+        "measurement_hash": _sha256_payload(measurement_records),
         "thresholds": threshold_values,
-        "envelope": envelope,
-        "train_stats": _split_stats(train_records, threshold_values),
-        "holdout_stats": _split_stats(holdout_records, threshold_values),
+        "envelope": claims["envelope"],
+        "train_stats": claims["train_stats"],
+        "holdout_stats": claims["holdout_stats"],
         "issued_at": issued_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     required_strings = (
@@ -585,6 +652,10 @@ def issue_certificate(
     if not isinstance(certificate["renderer_argv"], list) or not certificate["renderer_argv"]:
         raise ValueError("measurements do not contain a renderer argv template")
     certificate["certificate_sha256"] = _certificate_digest(certificate)
+    key = receipt_sign.load_operator_key(create=True)
+    certificate[CERTIFICATE_HMAC_FIELD] = receipt_sign.hmac_sha256(
+        certificate, key, omit_fields=(CERTIFICATE_HMAC_FIELD,),
+    )
     return certificate
 
 
@@ -612,16 +683,33 @@ def verify_certificate(
     expected_self_hash = cert.get("certificate_sha256")
     if not isinstance(expected_self_hash, str) or _certificate_digest(cert) != expected_self_hash:
         return _result(False, ["certificate_hash_mismatch"])
+    expected_hmac = cert.get(CERTIFICATE_HMAC_FIELD)
+    if expected_hmac is None:
+        return _result(False, ["certificate_hmac_missing"])
+    if not isinstance(expected_hmac, str) or not SHA256_RE.fullmatch(expected_hmac):
+        return _result(False, ["certificate_hmac_mismatch"])
+    try:
+        key = receipt_sign.load_operator_key(create=False)
+    except receipt_sign.ReceiptKeyMissing:
+        return _result(False, ["certificate_key_missing"])
+    except receipt_sign.ReceiptKeyInvalid:
+        return _result(False, ["certificate_key_invalid"])
+    if not receipt_sign.verify_hmac_sha256(
+        cert, key, expected_hmac, omit_fields=(CERTIFICATE_HMAC_FIELD,),
+    ):
+        return _result(False, ["certificate_hmac_mismatch"])
 
     required = (
         "renderer_id", "renderer_version", "renderer_binary_path", "renderer_binary_hash",
         "renderer_argv", "hancom_version", "corpus_manifest_path",
-        "corpus_manifest_hash", "thresholds", "envelope", "issued_at",
+        "corpus_manifest_hash", "measurement_records", "measurement_hash",
+        "thresholds", "envelope", "train_stats", "holdout_stats", "issued_at",
     )
     if cert.get("schema_version") != SCHEMA_VERSION or any(key not in cert for key in required):
         return _result(False, ["certificate_schema_invalid"])
     try:
-        _validate_thresholds(cert["thresholds"])
+        if _validate_thresholds(cert["thresholds"]) != cert["thresholds"]:
+            raise ValueError
         if not isinstance(cert["envelope"], list):
             raise ValueError
         for entry in cert["envelope"]:
@@ -634,6 +722,12 @@ def verify_certificate(
         if not SHA256_RE.fullmatch(str(cert["renderer_binary_hash"])):
             raise ValueError
         if not SHA256_RE.fullmatch(str(cert["corpus_manifest_hash"])):
+            raise ValueError
+        if not SHA256_RE.fullmatch(str(cert["measurement_hash"])):
+            raise ValueError
+        if not isinstance(cert["measurement_records"], list):
+            raise ValueError
+        if not isinstance(cert["train_stats"], dict) or not isinstance(cert["holdout_stats"], dict):
             raise ValueError
     except (AttributeError, TypeError, ValueError):
         return _result(False, ["certificate_schema_invalid"])
@@ -653,6 +747,19 @@ def verify_certificate(
     hancom_versions = {entry["hancom_version"] for entry in manifest["documents"]}
     if hancom_versions != {cert["hancom_version"]}:
         return _result(False, ["hancom_version_mismatch"])
+    if _sha256_payload(cert["measurement_records"]) != cert["measurement_hash"]:
+        return _result(False, ["measurement_hash_mismatch"])
+    try:
+        claims = _derive_certificate_claims(
+            manifest["documents"], cert["measurement_records"], cert["thresholds"],
+        )
+    except (AttributeError, TypeError, ValueError):
+        return _result(False, ["measurement_records_invalid"])
+    if cert["envelope"] != claims["envelope"]:
+        return _result(False, ["certificate_envelope_mismatch"])
+    if (cert["train_stats"] != claims["train_stats"]
+            or cert["holdout_stats"] != claims["holdout_stats"]):
+        return _result(False, ["certificate_stats_mismatch"])
 
     try:
         binary = Path(renderer_binary).expanduser().resolve() if renderer_binary is not None \
