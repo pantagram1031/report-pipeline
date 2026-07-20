@@ -222,16 +222,20 @@ class TestCertifiedRendererProbe(unittest.TestCase):
             ):
                 result = render_probe.probe()
 
-        self.assertEqual(
-            result["capabilities"]["render_certificate_reason"],
-            "certificate_valid",
-        )
-        renderer = next(
-            item for item in result["renderers"]
-            if item["proof_grade"] == "certified"
-        )
-        self.assertEqual(renderer["certificate"], str(cert_path.resolve()))
-        self.assertEqual(renderer["argv"], certificate["renderer_argv"])
+            self.assertEqual(
+                result["capabilities"]["render_certificate_reason"],
+                "certificate_valid",
+            )
+            renderer = next(
+                item for item in result["renderers"]
+                if item["proof_grade"] == "certified"
+            )
+            # Compare resolved paths while the file still exists: CI temp dirs
+            # can surface Windows 8.3 short names (RUNNER~1) on one side only.
+            self.assertEqual(
+                Path(renderer["certificate"]).resolve(), cert_path.resolve(),
+            )
+            self.assertEqual(renderer["argv"], certificate["renderer_argv"])
 
     def test_invalid_certificate_is_not_advertised(self):
         with tempfile.TemporaryDirectory() as tmp:
